@@ -1,0 +1,21 @@
+{
+  "name": "teacher-meme-generator",
+  "private": true,
+  "version": "1.1.0",
+  "description": "Teacher Meme Generator — 20 real meme formats, multi-step agentic captioning, school-safe by design. By Legends of Learning.",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "nanoid": "^5.0.0",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "sharp": "^0.34.0"
+  },
+  "scripts": {
+    "dev": "next dev --port 3001",
+    "build": "next build",
+    "start": "next start --port 3001",
+    "lint": "next lint",
+    "smoke:render": "node scripts/smoke-render.mjs"
+  }
+}

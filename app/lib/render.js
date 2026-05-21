@@ -1,0 +1,1402 @@
+// Server-side meme renderer using sharp + SVG overlays.
+//
+// ── Why we install fonts at startup instead of @font-face data: URLs ──
+// sharp 0.34's bundled librsvg (2.61) does NOT honor @font-face rules
+// at all — base64-embedded fonts, file:// URLs, every MIME variant,
+// they all silently fall back to a generic sans-serif. I tested seven
+// permutations and every single one rendered byte-identically to the
+// fallback, which means our memes were shipping in DejaVu/Helvetica
+// the whole time, not Anton. That's why teachers were seeing thin,
+// not-Impact-looking text no matter how much we cranked the stroke.
+//
+// The fix that actually works: install fonts into a directory the
+// OS font discovery layer (Core Text on macOS, fontconfig on Linux)
+// will scan, then reference them by their INTERNAL family name in
+// the SVG. We do this once per process at startup. On macOS we copy
+// to ~/Library/Fonts; on Linux to ~/.fonts (auto-scanned by
+// fontconfig). Copy is idempotent and cheap (~200KB).
+//
+// Internal font family names (from the TTF name table):
+//   Anton-Regular.ttf   -> "Anton"
+//   ComicNeue-Bold.ttf  -> "Comic Neue" (weight 700)
+//
+// ── Style keys ──
+//   "caption": Anton (Impact-substitute), ALL CAPS, white fill, heavy
+//              black stroke. Used on EVERY format (including formats
+//              like Drake / Expanding Brain whose right-side panels
+//              are blank — uniform Impact styling looks more like a
+//              real internet meme than mixing fonts/colors).
+//   "mocking": Anton + alternating mIxEd cAsE.
+//   "sign":    Anton on the cardboard "Change my mind" sign.
+//   "doge":    Comic Neue Bold, lowercase, colored fill + black stroke.
+
+import sharp from "sharp";
+import path from "node:path";
+import os from "node:os";
+import { promises as fs, existsSync, mkdirSync, copyFileSync } from "node:fs";
+
+// These MUST match the fonts' internal family names (as listed in
+// the TTF name table), not our own labels. librsvg/pango look up
+// fonts by that internal name via fontconfig/Core Text.
+const IMPACT_FAMILY = "Anton";
+const COMIC_FAMILY = "Comic Neue";
+
+// Where the OS font discovery layer scans for user fonts. macOS Core
+// Text scans ~/Library/Fonts automatically; Linux fontconfig scans
+// ~/.fonts (and ~/.local/share/fonts) on default install.
+function osUserFontsDir() {
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Fonts");
+  }
+  // Linux + Windows fall back to a fontconfig-scanned dir. On Linux
+  // ~/.fonts is the legacy path; ~/.local/share/fonts is the XDG
+  // path. We use the legacy path because fontconfig versions
+  // shipped with sharp's prebuilt libvips scan both. On Windows
+  // this is a noop directory — sharp on Windows uses DirectWrite
+  // which scans %WINDIR%\Fonts, but our deploy target is Linux.
+  return path.join(os.homedir(), ".fonts");
+}
+
+// Install our bundled OFL fonts into the OS user-fonts dir at module
+// load time, synchronously, BEFORE sharp/libvips's font cache is
+// initialized. If we did this asynchronously the first request might
+// race ahead of the copy, libvips would scan an empty dir, cache the
+// result, and never re-scan — that meme would (and every subsequent
+// render in the same process would) fall back to the system default.
+function installFontsSync() {
+  const srcDir = path.join(process.cwd(), "public", "fonts");
+  const dstDir = osUserFontsDir();
+  try {
+    mkdirSync(dstDir, { recursive: true });
+  } catch {}
+  const sources = ["Anton-Regular.ttf", "ComicNeue-Bold.ttf"];
+  for (const name of sources) {
+    const src = path.join(srcDir, name);
+    const dst = path.join(dstDir, name);
+    if (existsSync(dst)) continue;
+    try {
+      copyFileSync(src, dst);
+    } catch (err) {
+      // We're best-effort here. If the dest dir isn't writable we
+      // log and continue — the meme will fall back to a system font
+      // rather than crashing the server.
+      console.warn(
+        `[render] failed to install font ${name} -> ${dst}: ${err.message}`
+      );
+    }
+  }
+}
+
+installFontsSync();
+
+// Exposed only so tests/CLIs can verify the install ran. Production
+// code does not need to call this — the sync install above runs at
+// module load.
+export function ensureFontsInstalled() {
+  installFontsSync();
+  return Promise.resolve();
+}
+
+// Kept for back-compat with the rest of the renderer; now returns an
+// empty <defs> because @font-face data: URLs do not work in librsvg
+// 2.61 (the version sharp 0.34 bundles). Fonts are loaded by name
+// via Core Text / fontconfig from the OS user-fonts dir.
+async function getFontStyle() {
+  return "<defs></defs>";
+}
+
+// Per-font measured average glyph width (em fraction). Used by our
+// greedy line-wrap to pick the right size before librsvg ever sees
+// the SVG. Anton's letters average ~0.50em over A-Z, but caption
+// lines that load up on wide glyphs (M, W, O, G, D, R) measure
+// closer to 0.67em — and our worst-case is the worst line in any
+// caption. Erring slightly wide here prevents Anton wide-glyph
+// lines like "SMOOTH MORNING" from clipping past the zone's right
+// edge at the chosen font size.
+// Default corner; renderer picks br → bl → tr → tl based on caption collision.
+export const BRAND_WATERMARK_CORNER = "br";
+
+export const WATERMARK_CORNER_PRIORITY = ["br", "bl", "tr", "tl"];
+const LOGO_SCALE_STEPS = [1, 0.88, 0.76, 0.64, 0.55, 0.48];
+
+// Clearance between caption ink (incl. stroke) and the logo+pill.
+const WATERMARK_CLEARANCE_PX = 56;
+// Bbox width estimate for collision checks — wider than fitText uses so
+// we never under-estimate and let glyphs spill into the brand mark.
+const BBOX_CHAR_WIDTH = 0.72;
+const BBOX_CHAR_WIDTH_MOCKING = 0.78;
+const BBOX_SAFETY_FACTOR = 1.12;
+
+function rectsOverlapPx(a, b) {
+  return (
+    a.left < b.right &&
+    a.right > b.left &&
+    a.top < b.bottom &&
+    a.bottom > b.top
+  );
+}
+
+function overlapAreaPx(a, b) {
+  const left = Math.max(a.left, b.left);
+  const right = Math.min(a.right, b.right);
+  const top = Math.max(a.top, b.top);
+  const bottom = Math.min(a.bottom, b.bottom);
+  if (left >= right || top >= bottom) return 0;
+  return (right - left) * (bottom - top);
+}
+
+/** Target logo width; scales down when corners are crowded. */
+export function computeLogoTargetWidth(imgW, scale = 1) {
+  const base = Math.max(120, Math.min(180, Math.round(imgW * 0.14)));
+  const floor = Math.max(88, Math.round(imgW * 0.085));
+  return Math.max(floor, Math.round(base * scale));
+}
+
+function zoneToObstacleRect(zone, imgW, imgH, padPx = 16) {
+  const y0 = zone.y * imgH;
+  const y1 = (zone.y + zone.h) * imgH;
+  const isBottom = zone.y + zone.h > 0.68;
+  const isTop = zone.y + zone.h < 0.28;
+
+  // Impact-style top/bottom bands span the full width on real memes.
+  if (isBottom) {
+    return {
+      left: 0,
+      top: Math.max(0, y0 - padPx * 2),
+      right: imgW,
+      bottom: imgH,
+    };
+  }
+  if (isTop) {
+    return {
+      left: 0,
+      top: 0,
+      right: imgW,
+      bottom: Math.min(imgH, y1 + padPx * 3),
+    };
+  }
+  return {
+    left: zone.x * imgW - padPx,
+    top: y0 - padPx,
+    right: (zone.x + zone.w) * imgW + padPx,
+    bottom: y1 + padPx,
+  };
+}
+
+/** AI gallery PNGs bake full-width caption strips into the pixels. */
+function galleryArtObstacleRects(format, imgW, imgH) {
+  const src = format.file || "";
+  if (!src.includes("/gallery/")) return [];
+  return [
+    { left: 0, top: imgH * 0.64, right: imgW, bottom: imgH },
+    { left: 0, top: 0, right: imgW, bottom: imgH * 0.24 },
+  ];
+}
+
+function expandObstacleRect(rect, padPx) {
+  return {
+    left: rect.left - padPx,
+    top: rect.top - padPx,
+    right: rect.right + padPx,
+    bottom: rect.bottom + padPx,
+  };
+}
+
+function bakedObstacleRects(format, imgW, imgH) {
+  const rects = [];
+  for (const b of format.bakedObstacles || []) {
+    rects.push({
+      left: b.x * imgW,
+      top: b.y * imgH,
+      right: (b.x + b.w) * imgW,
+      bottom: (b.y + b.h) * imgH,
+    });
+  }
+  return rects;
+}
+
+function cornerPriority(format) {
+  const preferred = format.watermarkCorner || BRAND_WATERMARK_CORNER;
+  return [
+    preferred,
+    ...WATERMARK_CORNER_PRIORITY.filter((c) => c !== preferred),
+  ];
+}
+
+function scorePlacement(reserve, obstacles) {
+  let area = 0;
+  let hits = 0;
+  for (const obs of obstacles) {
+    const a = overlapAreaPx(reserve, obs);
+    if (a > 0) {
+      area += a;
+      hits++;
+    }
+  }
+  return hits * 1e9 + area;
+}
+
+function collectStaticObstacles(format, imgW, imgH) {
+  const obstacles = [
+    ...bakedObstacleRects(format, imgW, imgH),
+    ...galleryArtObstacleRects(format, imgW, imgH),
+  ];
+  for (const zone of format.zones || []) {
+    if (zone.decorative) continue;
+    obstacles.push(zoneToObstacleRect(zone, imgW, imgH, 16));
+  }
+  return obstacles;
+}
+
+/** Bottom/top caption bands occupy the lower/upper corners — never put logo there. */
+function cornersAllowedForObstacles(obstacles, imgW, imgH, preferredOrder) {
+  const wide = (o) => o.right - o.left >= imgW * 0.65;
+  const bottomBand = obstacles.some(
+    (o) => wide(o) && o.bottom >= imgH * 0.88
+  );
+  const topBand = obstacles.some((o) => wide(o) && o.top <= imgH * 0.12);
+
+  let allowed = [...preferredOrder];
+  if (bottomBand) {
+    allowed = allowed.filter((c) => c !== "br" && c !== "bl");
+  }
+  if (topBand) {
+    allowed = allowed.filter((c) => c !== "tr" && c !== "tl");
+  }
+  if (allowed.length === 0) {
+    allowed = bottomBand
+      ? ["tr", "tl"]
+      : topBand
+        ? ["br", "bl"]
+        : [...WATERMARK_CORNER_PRIORITY];
+  }
+  return allowed;
+}
+
+function layoutCaptionBboxes(format, captions, size, watermark) {
+  const bboxes = [];
+  for (const zone of format.zones || []) {
+    if (zone.decorative) continue;
+    const text = captions?.[zone.key];
+    if (text == null || !String(text).trim()) continue;
+    const { bbox } = renderZone(
+      zone,
+      text,
+      size.width,
+      size.height,
+      watermark
+    );
+    if (bbox) bboxes.push(expandObstacleRect(bbox, 24));
+  }
+  return bboxes;
+}
+
+/** Pixel bbox of logo + dark pill + safety margin. */
+export function computeBrandReservePx(
+  corner,
+  imgW,
+  imgH,
+  logoW,
+  logoH,
+  margin,
+  pillPadX,
+  pillPadY
+) {
+  const pillW = logoW + pillPadX * 2;
+  const pillH = logoH + pillPadY * 2;
+  const pad = WATERMARK_CLEARANCE_PX;
+  switch (corner) {
+    case "br":
+      return {
+        left: imgW - margin - pillW - pad,
+        top: imgH - margin - pillH - pad,
+        right: imgW,
+        bottom: imgH,
+      };
+    case "bl":
+      return {
+        left: 0,
+        top: imgH - margin - pillH - pad,
+        right: margin + pillW + pad,
+        bottom: imgH,
+      };
+    case "tr":
+      return {
+        left: imgW - margin - pillW - pad,
+        top: 0,
+        right: imgW,
+        bottom: margin + pillH + pad,
+      };
+    default:
+      return {
+        left: 0,
+        top: 0,
+        right: margin + pillW + pad,
+        bottom: margin + pillH + pad,
+      };
+  }
+}
+
+/** Shrink a caption box so its rectangle does not overlap the brand reserve. */
+function applyReserveToZone(box, reserve, corner = BRAND_WATERMARK_CORNER) {
+  if (!reserve) return box;
+  let { x, y, w, h } = box;
+
+  // Bottom-corner logos: shrink bottom bands away from the brand footprint.
+  if (box.isBottomBand && (corner === "br" || corner === "bl")) {
+    if (corner === "br" && x + w > reserve.left) {
+      w = Math.max(56, reserve.left - x);
+    }
+    if (corner === "bl" && x < reserve.right) {
+      const nx = reserve.right;
+      w = Math.max(56, x + w - nx);
+      x = nx;
+    }
+    if (y + h > reserve.top) h = Math.max(36, reserve.top - y);
+  }
+
+  if (!rectsOverlapPx({ x, y, w, h }, reserve)) return { x, y, w, h };
+
+  if (reserve.right >= x + w - 0.5) {
+    w = Math.max(56, reserve.left - x);
+  }
+  if (reserve.left <= x + 0.5) {
+    const nx = reserve.right;
+    w = Math.max(56, x + w - nx);
+    x = nx;
+  }
+  if (reserve.bottom >= y + h - 0.5) {
+    h = Math.max(36, reserve.top - y);
+  }
+  if (reserve.top <= y + 0.5) {
+    const ny = reserve.bottom;
+    h = Math.max(36, y + h - ny);
+    y = ny;
+  }
+  return { x, y, w, h };
+}
+
+/** Nudge layout so measured ink stays outside the brand reserve. */
+function fitCaptionAwayFromReserve({
+  reserve,
+  corner,
+  zone,
+  text,
+  x,
+  y,
+  w,
+  h,
+  align,
+  tx,
+  fs,
+  lines,
+  lineHeight,
+  strokeWidth,
+  strokeRatio,
+  family,
+}) {
+  let blockTop = y + (h - lines.length * lineHeight) / 2;
+  const isBottomBand = zone.y + zone.h > 0.68;
+  if (isBottomBand && reserve && (corner === "br" || corner === "bl")) {
+    blockTop = y + Math.max(4, fs * 0.12);
+  }
+
+  let curTx = tx;
+  let curFs = fs;
+  let curLines = lines;
+  let curLh = lineHeight;
+  let curStroke = strokeWidth;
+
+  for (let n = 0; n < 32; n++) {
+    const totalH = curLines.length * curLh;
+    if (
+      isBottomBand &&
+      reserve &&
+      (corner === "br" || corner === "bl") &&
+      blockTop + totalH + curStroke > reserve.top
+    ) {
+      blockTop = Math.max(y, reserve.top - totalH - curStroke - 4);
+    }
+
+    const bbox = measureCaptionBBox({
+      align,
+      tx: curTx,
+      x,
+      w,
+      blockTop,
+      totalH,
+      fs: curFs,
+      lines: curLines,
+      lineHeight: curLh,
+      strokeWidth: curStroke,
+      family,
+      wideGlyphs: zone.style === "mocking",
+    });
+
+    if (!reserve || !rectsOverlapPx(bbox, reserve)) {
+      return {
+        tx: curTx,
+        fs: curFs,
+        lines: curLines,
+        lineHeight: curLh,
+        strokeWidth: curStroke,
+        blockTop,
+        firstBaseline: blockTop + curFs * 0.92,
+      };
+    }
+
+    if (corner === "br") {
+      const maxRight = reserve.left - WATERMARK_CLEARANCE_PX;
+      if (align === "center") {
+        const overflow = bbox.right - maxRight;
+        if (overflow > 0) curTx -= overflow;
+      } else if (align === "right" && bbox.right > maxRight) {
+        curTx -= bbox.right - maxRight;
+      }
+      if (bbox.bottom > reserve.top - WATERMARK_CLEARANCE_PX) {
+        const lift =
+          bbox.bottom - (reserve.top - WATERMARK_CLEARANCE_PX);
+        blockTop = Math.max(y, blockTop - lift);
+      }
+    } else if (corner === "bl" && align === "center") {
+      const overflow =
+        reserve.right + WATERMARK_CLEARANCE_PX - bbox.left;
+      if (overflow > 0) curTx += overflow;
+    }
+
+    curFs = Math.max(12, Math.floor(curFs * 0.88));
+    curLh = curFs;
+    const refit = fitText(text, w, h, zone.maxLines || 3, family, curFs);
+    curLines = refit.lines;
+    curLh = refit.lineHeight;
+    curStroke =
+      strokeRatio > 0
+        ? Math.min(22, Math.max(4, curFs * strokeRatio))
+        : 0;
+    blockTop = y + (h - curLines.length * curLh) / 2;
+    if (isBottomBand && (corner === "br" || corner === "bl")) {
+      blockTop = y + Math.max(4, curFs * 0.12);
+    }
+  }
+
+  const totalH = curLines.length * curLh;
+  return enforceCaptionClearOfReserve({
+    reserve,
+    corner,
+    zone,
+    text,
+    x,
+    y,
+    w,
+    h,
+    align,
+    tx: curTx,
+    fs: curFs,
+    lines: curLines,
+    lineHeight: curLh,
+    strokeWidth: curStroke,
+    strokeRatio,
+    family,
+    blockTop,
+    firstBaseline: blockTop + curFs * 0.92,
+  });
+}
+
+/** Final pass: shrink / shift until measured ink clears the brand reserve. */
+function enforceCaptionClearOfReserve(ctx) {
+  let {
+    reserve,
+    corner,
+    zone,
+    text,
+    x,
+    y,
+    w,
+    h,
+    align,
+    tx,
+    fs,
+    lines,
+    lineHeight,
+    strokeWidth,
+    strokeRatio,
+    family,
+    blockTop,
+  } = ctx;
+
+  for (let pass = 0; pass < 48; pass++) {
+    const totalH = lines.length * lineHeight;
+    const bbox = measureCaptionBBox({
+      align,
+      tx,
+      x,
+      w,
+      blockTop,
+      totalH,
+      fs,
+      lines,
+      lineHeight,
+      strokeWidth,
+      family,
+      wideGlyphs: zone.style === "mocking",
+    });
+    if (!reserve || !rectsOverlapPx(bbox, reserve)) {
+      return {
+        tx,
+        fs,
+        lines,
+        lineHeight,
+        strokeWidth,
+        blockTop,
+        firstBaseline: blockTop + fs * 0.92,
+      };
+    }
+    if (corner === "br") {
+      const maxRight = reserve.left - WATERMARK_CLEARANCE_PX;
+      if (bbox.right > maxRight) tx -= bbox.right - maxRight;
+      if (bbox.bottom > reserve.top - WATERMARK_CLEARANCE_PX) {
+        blockTop -= bbox.bottom - (reserve.top - WATERMARK_CLEARANCE_PX);
+        blockTop = Math.max(y, blockTop);
+      }
+    } else if (corner === "bl") {
+      const minLeft = reserve.right + WATERMARK_CLEARANCE_PX;
+      if (bbox.left < minLeft) tx += minLeft - bbox.left;
+      if (bbox.bottom > reserve.top - WATERMARK_CLEARANCE_PX) {
+        blockTop -= bbox.bottom - (reserve.top - WATERMARK_CLEARANCE_PX);
+        blockTop = Math.max(y, blockTop);
+      }
+    }
+    fs = Math.max(10, fs - 2);
+    lineHeight = fs;
+    const refit = fitText(text, w, h, zone.maxLines || 3, family, fs);
+    lines = refit.lines;
+    lineHeight = refit.lineHeight;
+    strokeWidth =
+      strokeRatio > 0
+        ? Math.min(22, Math.max(4, fs * strokeRatio))
+        : 0;
+    const isBottomBand = zone.y + zone.h > 0.68;
+    blockTop = y + (h - lines.length * lineHeight) / 2;
+    if (isBottomBand && (corner === "br" || corner === "bl")) {
+      blockTop = y + Math.max(4, fs * 0.12);
+    }
+  }
+
+  return {
+    tx,
+    fs,
+    lines,
+    lineHeight,
+    strokeWidth,
+    blockTop,
+    firstBaseline: blockTop + fs * 0.92,
+  };
+}
+
+export function measureCaptionBBox({
+  align,
+  tx,
+  x,
+  w,
+  blockTop,
+  totalH,
+  fs,
+  lines,
+  lineHeight,
+  strokeWidth,
+  family,
+  wideGlyphs,
+}) {
+  const charW = fs * (wideGlyphs ? BBOX_CHAR_WIDTH_MOCKING : BBOX_CHAR_WIDTH);
+  const lineWidths = lines.map((l) => l.length * charW);
+  const textW = Math.max(...lineWidths, 1) * BBOX_SAFETY_FACTOR;
+  let left;
+  let right;
+  if (align === "center") {
+    left = tx - textW / 2;
+    right = tx + textW / 2;
+  } else if (align === "right") {
+    right = tx;
+    left = tx - textW;
+  } else {
+    left = tx;
+    right = tx + textW;
+  }
+  const sw = strokeWidth || 0;
+  return {
+    left: left - sw,
+    right: right + sw,
+    top: blockTop - sw,
+    bottom: blockTop + totalH + sw,
+  };
+}
+
+/** Pad PNG to 1:1 with centered letterbox (black bars). */
+export async function padPngToSquare(pngBuf) {
+  const meta = await sharp(pngBuf).metadata();
+  const side = Math.max(meta.width, meta.height);
+  return sharp({
+    create: {
+      width: side,
+      height: side,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 1 },
+    },
+  })
+    .composite([
+      {
+        input: pngBuf,
+        top: Math.floor((side - meta.height) / 2),
+        left: Math.floor((side - meta.width) / 2),
+      },
+    ])
+    .png({ compressionLevel: 9, quality: 92 })
+    .toBuffer();
+}
+
+function avgCharWidth(family) {
+  if (family === COMIC_FAMILY) return 0.55;
+  // Anton averages 0.50em across the alphabet at all caps. Real
+  // captions skew slightly wider because they tend to have round
+  // glyphs (O, G, C, D) and double-stem letters (M, W) — a 0.55
+  // bias makes the widest-line wrap calculation err on the side of
+  // fitting without underweighting fs. This number was tuned AGAINST
+  // the actual Anton font once we got librsvg to load it; before
+  // that fix librsvg was silently falling back to Helvetica-Bold
+  // (≈0.67em average) and the renderer was tuned to compensate for
+  // that wrong font, which is why everything looked thin.
+  return 0.55;
+}
+
+function escXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Alternate caps starting lowercase, leaving non-letters alone.
+function toMockingCase(text) {
+  let out = "";
+  let i = 0;
+  for (const ch of text) {
+    if (/[A-Za-z]/.test(ch)) {
+      out += i % 2 === 0 ? ch.toLowerCase() : ch.toUpperCase();
+      i++;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+// Greedy fallback wrapper, kept for the (rare) case where no balanced
+// split is feasible at any font size. The renderer's main path is
+// `balancedSplit` below.
+function wrapText(text, maxWidth, fontSize, family) {
+  const w = avgCharWidth(family) * fontSize;
+  const words = String(text).split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (line && candidate.length * w > maxWidth) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line) lines.push(line);
+  return lines.length > 0 ? lines : [""];
+}
+
+// Split `words` into exactly `k` contiguous, non-empty lines so that
+// the WIDEST line is as narrow as possible (minimax balancing). DP:
+// `dp[i][j]` = best max-line-chars when first `i` words are split
+// into `j` lines. O(n^2 * k); n is small (caption-sized).
+//
+// Returns `{ lines: string[], maxChars: number }` or null if `k` is
+// infeasible (e.g. more lines than words).
+function balancedSplit(words, k) {
+  const n = words.length;
+  if (n === 0 || k <= 0 || k > n) return null;
+
+  // chars per line = sum(word lengths) + (numWords - 1) for spaces
+  const lens = words.map((w) => w.length);
+  const pref = [0];
+  for (let i = 0; i < n; i++) pref.push(pref[i] + lens[i]);
+  const lineChars = (s, e) => pref[e] - pref[s] + (e - s - 1);
+
+  const INF = Infinity;
+  // dp[i][j] = { maxC, splitAt } — splitAt is where line j starts.
+  const dp = Array.from({ length: n + 1 }, () =>
+    Array.from({ length: k + 1 }, () => null)
+  );
+  dp[0][0] = { maxC: 0, splitAt: -1 };
+
+  for (let j = 1; j <= k; j++) {
+    // Line j must consume at least 1 word, and leave at least k-j
+    // words for the remaining lines.
+    for (let i = j; i <= n - (k - j); i++) {
+      let best = null;
+      for (let s = j - 1; s <= i - 1; s++) {
+        if (!dp[s][j - 1]) continue;
+        const lw = lineChars(s, i);
+        const maxC = Math.max(dp[s][j - 1].maxC, lw);
+        if (!best || maxC < best.maxC) best = { maxC, splitAt: s };
+      }
+      dp[i][j] = best;
+    }
+  }
+  if (!dp[n][k]) return null;
+
+  const lines = [];
+  let i = n,
+    j = k;
+  while (j > 0) {
+    const s = dp[i][j].splitAt;
+    lines.unshift(words.slice(s, i).join(" "));
+    i = s;
+    j--;
+  }
+  return { lines, maxChars: dp[n][k].maxC };
+}
+
+// Classic meme captions rarely fill the entire zone height — they sit
+// around 40–50% of the band with breathing room. Without this cap,
+// short custom text ("TESTTT") balloons to ~95% of zone height and
+// the heavy stroke reads as a solid black slab covering the photo.
+const MAX_LINE_FS_RATIO = 0.46;
+
+// Choose font size + line layout. Tries every `k` in [1..maxLines],
+// picks the smallest `k` whose font size is within 75% of the best,
+// so we prefer FEWER LINES with a slightly smaller font over many
+// short pyramid-shaped lines (which is what made wraps like
+// "FINISHING / THE FULL / LESSON / PLAN" look amateurish — the
+// inspiration captions always look balanced).
+function fitText(text, maxWidth, maxHeight, maxLines, family, startSize) {
+  const words = String(text).trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return { fs: 12, lines: [""], lineHeight: 12 };
+  }
+
+  const cap = Math.max(14, Math.floor(startSize));
+  const charPerFs = avgCharWidth(family);
+  const charCount = words.join(" ").length;
+
+  const candidates = [];
+  const lim = Math.min(maxLines, words.length);
+  for (let k = 1; k <= lim; k++) {
+    const split = balancedSplit(words, k);
+    if (!split) continue;
+
+    const lineSlot = maxHeight / k;
+    // Max fs constrained by widest line width AND per-line height.
+    const widthFs = maxWidth / (split.maxChars * charPerFs);
+    const heightFs = lineSlot * MAX_LINE_FS_RATIO;
+    let fs = Math.floor(Math.min(widthFs, heightFs, cap));
+    // Very short strings shouldn't scale to the width limit alone —
+    // keep them closer to a "label" size so they don't dominate the
+    // frame (Hide the Pain Harold customize was the main offender).
+    if (charCount <= 14 && k === 1) {
+      fs = Math.floor(Math.min(fs, lineSlot * 0.38, widthFs * 0.55));
+    }
+    if (fs < 12) continue;
+    candidates.push({ fs, lines: split.lines, k });
+  }
+
+  if (candidates.length === 0) {
+    // Last resort: greedy wrap at min size; better than crashing.
+    return {
+      fs: 12,
+      lines: wrapText(text, maxWidth, 12, family),
+      lineHeight: 12,
+    };
+  }
+
+  // Fewer-lines preference: among (k, fs) pairs, accept any whose
+  // fs is at least 75% of the best fs, then take the smallest k.
+  // This produces the "STUDENTS / READING / DIRECTIONS" feel rather
+  // than fragmented "FINISHING / THE FULL / LESSON / PLAN".
+  const maxFs = Math.max(...candidates.map((c) => c.fs));
+  const threshold = maxFs * 0.75;
+  const acceptable = candidates.filter((c) => c.fs >= threshold);
+  acceptable.sort((a, b) => a.k - b.k);
+  const chosen = acceptable[0];
+
+  return { fs: chosen.fs, lines: chosen.lines, lineHeight: chosen.fs };
+}
+
+function resolveZoneStyle(zone) {
+  switch (zone.style) {
+    case "mocking":
+      return {
+        family: IMPACT_FAMILY,
+        transform: toMockingCase,
+        fill: "#ffffff",
+        stroke: "#000000",
+        strokeRatio: 0.28,
+      };
+    case "sign":
+      return {
+        family: IMPACT_FAMILY,
+        transform: (s) => s.toUpperCase(),
+        fill: "#1a1a1a",
+        stroke: "none",
+        strokeRatio: 0,
+      };
+    case "doge":
+      return {
+        family: COMIC_FAMILY,
+        transform: (s) => s.toLowerCase(),
+        fill: zone.color || "#ff3b3b",
+        stroke: "#000000",
+        strokeRatio: 0.06,
+      };
+    case "dark-on-light":
+    case "caption":
+    default:
+      // Unified caption look: Impact white-fill + heavy black stroke
+      // ALL CAPS. Same on photographic backgrounds AND on Drake-style
+      // blank panels — that's what real internet memes look like.
+      //
+      // Stroke ratio 0.28 with paint-order=stroke fill gives a visible
+      // outline of ~14% of font size. That's higher than the canonical
+      // ~10% you see on imgflip renders, but at the resolutions the
+      // gallery thumbnails get downscaled to (1536px -> ~250px wide,
+      // a 6x reduction), a 10% stroke shrinks to 1-2 visible pixels
+      // and reads as "thin". The bumped ratio keeps the chunky
+      // AI-baked feel even after thumbnailing.
+      return {
+        family: IMPACT_FAMILY,
+        transform: (s) => s.toUpperCase(),
+        fill: "#ffffff",
+        stroke: "#000000",
+        strokeRatio: 0.28,
+      };
+  }
+}
+
+// Minimum render width. Templates ship at varying native resolutions
+// (Crying Cat is 300×300, Drake is 1200×1200). Rendering each at its
+// native size makes the small ones look thin and amateurish compared
+// to the curated gallery — Impact font weight reads better with more
+// pixels. We always upscale to at least OUTPUT_MIN_WIDTH so every
+// finished meme has the same chunky, heavy-stroke look you see in
+// viral teacher memes regardless of source template size.
+const OUTPUT_MIN_WIDTH = 1080;
+
+export function getRenderSize(format) {
+  if (format.width >= OUTPUT_MIN_WIDTH) {
+    return { width: format.width, height: format.height };
+  }
+  const scale = OUTPUT_MIN_WIDTH / format.width;
+  return {
+    width: OUTPUT_MIN_WIDTH,
+    height: Math.round(format.height * scale),
+  };
+}
+
+function renderZone(zone, rawText, imgW, imgH, watermark) {
+  if (rawText == null || String(rawText).trim() === "") {
+    return { fragment: "", bbox: null };
+  }
+  const style = resolveZoneStyle(zone);
+  const text = style.transform(String(rawText).trim());
+
+  let x = zone.x * imgW;
+  let y = zone.y * imgH;
+  let w = zone.w * imgW;
+  let h = zone.h * imgH;
+
+  const isBottomBand = zone.y + zone.h > 0.62;
+  if (watermark?.reservePx) {
+    ({ x, y, w, h } = applyReserveToZone(
+      { x, y, w, h, isBottomBand },
+      watermark.reservePx,
+      watermark.corner
+    ));
+  }
+
+  const naturalStart = Math.min(h * 0.55, w * 0.22);
+  let zoneMaxFs =
+    zone.maxFontSize ?? Math.floor((h / (zone.maxLines || 2)) * 0.48);
+  let startSize = Math.min(naturalStart, zoneMaxFs);
+
+  let { fs, lines, lineHeight } = fitText(
+    text,
+    w,
+    h,
+    zone.maxLines || 3,
+    style.family,
+    startSize
+  );
+
+  const align = zone.align || "center";
+  let anchor = "middle";
+  let tx = x + w / 2;
+  if (align === "left") {
+    anchor = "start";
+    tx = x;
+  } else if (align === "right") {
+    anchor = "end";
+    tx = x + w;
+  }
+
+  const strokeWidth =
+    style.strokeRatio > 0
+      ? Math.min(22, Math.max(4, fs * style.strokeRatio))
+      : 0;
+
+  const laid = fitCaptionAwayFromReserve({
+    reserve: watermark?.reservePx,
+    corner: watermark?.corner,
+    zone,
+    text,
+    x,
+    y,
+    w,
+    h,
+    align,
+    tx,
+    fs,
+    lines,
+    lineHeight,
+    strokeWidth,
+    strokeRatio: style.strokeRatio,
+    family: style.family,
+  });
+  fs = laid.fs;
+  lines = laid.lines;
+  lineHeight = laid.lineHeight;
+  tx = laid.tx;
+  const blockTop = laid.blockTop;
+  const firstBaseline = laid.firstBaseline;
+  const strokeWidthFinal = laid.strokeWidth;
+
+  const textEls = lines
+    .map((line, i) => {
+      const ly = firstBaseline + i * lineHeight;
+      const strokeAttrs =
+        strokeWidthFinal > 0
+          ? ` stroke="${style.stroke}" stroke-width="${strokeWidthFinal.toFixed(
+              2
+            )}" stroke-linejoin="round" paint-order="stroke fill"`
+          : "";
+      return `<text x="${tx.toFixed(2)}" y="${ly.toFixed(
+        2
+      )}" font-family="${style.family}" font-size="${fs.toFixed(
+        2
+      )}" fill="${style.fill}"${strokeAttrs} text-anchor="${anchor}">${escXml(line)}</text>`;
+    })
+    .join("\n");
+
+  // Tight mask: only covers the caption glyphs (+ small pad), not the
+  // full zone band. Used on AI gallery sources that still have baked-in
+  // text when no blank `renderFile` template exists yet.
+  if (zone.maskTight && lines.some((l) => l.trim())) {
+    const padX = fs * 0.22;
+    const padY = fs * 0.14;
+    const maxLineLen = Math.max(...lines.map((l) => l.length));
+    const textBlockW = maxLineLen * fs * avgCharWidth(style.family);
+    const boxW = Math.min(w, textBlockW + padX * 2);
+    const boxH = lines.length * lineHeight + padY * 2;
+    let boxX;
+    if (align === "center") boxX = tx - boxW / 2;
+    else if (align === "left") boxX = x;
+    else boxX = x + w - boxW;
+    const boxY = blockTop - padY;
+    const fill = zone.maskFill || "rgba(0,0,0,0.78)";
+    const rx = Math.min(fs * 0.12, boxH / 4);
+    const mask = `<rect x="${boxX.toFixed(2)}" y="${boxY.toFixed(
+      2
+    )}" width="${boxW.toFixed(2)}" height="${boxH.toFixed(
+      2
+    )}" rx="${rx.toFixed(2)}" fill="${fill}"/>`;
+    const bbox = measureCaptionBBox({
+      align,
+      tx,
+      x,
+      w,
+      blockTop,
+      totalH: lines.length * lineHeight,
+      fs,
+      lines,
+      lineHeight,
+      strokeWidth: strokeWidthFinal,
+      family: style.family,
+      wideGlyphs: zone.style === "mocking",
+    });
+    return { fragment: `${mask}\n${textEls}`, bbox };
+  }
+
+  const bbox = measureCaptionBBox({
+    align,
+    tx,
+    x,
+    w,
+    blockTop,
+    totalH: lines.length * lineHeight,
+    fs,
+    lines,
+    lineHeight,
+    strokeWidth: strokeWidthFinal,
+    family: style.family,
+    wideGlyphs: zone.style === "mocking",
+  });
+  return { fragment: textEls, bbox };
+}
+
+async function buildSvgOverlay(format, captions, watermark, size) {
+  const W = size.width;
+  const H = size.height;
+  const fontStyle = await getFontStyle();
+  const parts = [];
+  // First pass: any per-zone background mask. Used by gallery-derived
+  // templates whose source pixels already carry an AI-baked caption
+  // (and watermark). The mask is opaque and covers the FULL zone —
+  // both the baked text AND the baked watermark — so neither leaks
+  // through. The renderer then composites a fresh logo on top in
+  // renderMeme(), giving a clean stacked result:
+  //   source -> opaque mask -> fresh caption -> fresh watermark.
+  // Text zone shrinking against the watermark happens in renderZone,
+  // so the new caption never overlaps the new watermark even though
+  // the mask underneath does.
+  //
+  // `decorative: true` zones are mask-only (no rendered caption, not
+  // shown in the customize form, not asked of the LLM). We use these
+  // to cover AI-baked text in positions where the format has no
+  // matching caption slot — e.g. the conspiracy-board AI image has
+  // text at TOP and BOTTOM but the format only takes one caption,
+  // so the OTHER position needs a silent mask or it bleeds through.
+  for (const zone of format.zones) {
+    if (!zone.maskFill || zone.maskTight) continue;
+    const hasCaption =
+      captions?.[zone.key] != null &&
+      String(captions[zone.key]).trim() !== "";
+    if (!zone.decorative && !hasCaption) continue;
+    const rx = (zone.x * W).toFixed(2);
+    const ry = (zone.y * H).toFixed(2);
+    const rw = (zone.w * W).toFixed(2);
+    const rh = (zone.h * H).toFixed(2);
+    parts.push(
+      `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="${zone.maskFill}"/>`
+    );
+  }
+  for (const zone of format.zones) {
+    if (zone.decorative) continue;
+    const rendered = renderZone(zone, captions?.[zone.key], W, H, watermark);
+    if (rendered?.fragment) parts.push(rendered.fragment);
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+${fontStyle}
+${parts.join("\n")}
+</svg>`;
+}
+
+function attachWatermarkPixelCoords(plan, size) {
+  const { corner, logoMeta, margin, pillPadX, pillPadY } = plan;
+  const pillW = logoMeta.width + pillPadX * 2;
+  const pillH = logoMeta.height + pillPadY * 2;
+  let pillLeft;
+  let pillTop;
+  if (corner === "br") {
+    pillLeft = size.width - pillW - margin;
+    pillTop = size.height - pillH - margin;
+  } else if (corner === "bl") {
+    pillLeft = margin;
+    pillTop = size.height - pillH - margin;
+  } else if (corner === "tr") {
+    pillLeft = size.width - pillW - margin;
+    pillTop = margin;
+  } else {
+    pillLeft = margin;
+    pillTop = margin;
+  }
+  return {
+    ...plan,
+    pillW,
+    pillH,
+    pillLeft,
+    pillTop,
+    logoLeftPx: pillLeft + pillPadX,
+    logoTopPx: pillTop + pillPadY,
+  };
+}
+
+/**
+ * Pick watermark corner + scale so the logo never overlaps caption ink,
+ * zone boxes, or format `bakedObstacles` (AI-baked punchlines on templates).
+ */
+export async function resolveWatermarkPlacement(format, captions, size) {
+  const W = size.width;
+  const H = size.height;
+  const staticObstacles = collectStaticObstacles(format, W, H);
+  const preferred = cornerPriority(format);
+  let best = null;
+
+  for (const logoScale of LOGO_SCALE_STEPS) {
+    const logoTargetW = computeLogoTargetWidth(W, logoScale);
+    const logoBuf = await loadLogoBuffer(logoTargetW);
+    const logoMeta = await sharp(logoBuf).metadata();
+    const margin = Math.max(12, Math.round(W * 0.02));
+    const pillPadX = Math.round(logoMeta.width * 0.16);
+    const pillPadY = Math.round(logoMeta.height * 0.32);
+
+    const corners = cornersAllowedForObstacles(
+      staticObstacles,
+      W,
+      H,
+      preferred
+    );
+
+    for (const corner of corners) {
+      const reservePx = computeBrandReservePx(
+        corner,
+        W,
+        H,
+        logoMeta.width,
+        logoMeta.height,
+        margin,
+        pillPadX,
+        pillPadY
+      );
+      const watermark = { corner, reservePx };
+      const captionBboxes = layoutCaptionBboxes(
+        format,
+        captions,
+        size,
+        watermark
+      );
+
+      let violations = 0;
+      for (const bbox of captionBboxes) {
+        if (captionInkOverlapsBrandReserve(bbox, reservePx)) violations++;
+      }
+
+      const score =
+        scorePlacement(reservePx, [...staticObstacles, ...captionBboxes]) +
+        violations * 5e9;
+
+      const candidate = {
+        corner,
+        logoScale,
+        logoBuf,
+        logoMeta,
+        margin,
+        pillPadX,
+        pillPadY,
+        reservePx,
+        score,
+        violations,
+      };
+
+      if (violations === 0 && score === 0) {
+        return attachWatermarkPixelCoords(candidate, size);
+      }
+      if (
+        !best ||
+        score < best.score ||
+        (score === best.score && logoScale > best.logoScale)
+      ) {
+        best = candidate;
+      }
+    }
+  }
+
+  if (best && best.violations === 0 && best.score === 0) {
+    return attachWatermarkPixelCoords(best, size);
+  }
+
+  // Hard fallback: top corner, smallest logo — never stack on bottom captions.
+  const fallbackCorner = cornersAllowedForObstacles(
+    staticObstacles,
+    W,
+    H,
+    preferred
+  ).includes("tr")
+    ? "tr"
+    : cornersAllowedForObstacles(staticObstacles, W, H, preferred)[0] ||
+      "tr";
+  const logoTargetW = computeLogoTargetWidth(W, 0.48);
+  const logoBuf = await loadLogoBuffer(logoTargetW);
+  const logoMeta = await sharp(logoBuf).metadata();
+  const margin = Math.max(12, Math.round(W * 0.02));
+  const pillPadX = Math.round(logoMeta.width * 0.16);
+  const pillPadY = Math.round(logoMeta.height * 0.32);
+  const reservePx = computeBrandReservePx(
+    fallbackCorner,
+    W,
+    H,
+    logoMeta.width,
+    logoMeta.height,
+    margin,
+    pillPadX,
+    pillPadY
+  );
+  return attachWatermarkPixelCoords(
+    {
+      corner: fallbackCorner,
+      logoScale: 0.48,
+      logoBuf,
+      logoMeta,
+      margin,
+      pillPadX,
+      pillPadY,
+      reservePx,
+      score: 0,
+      violations: 0,
+    },
+    size
+  );
+}
+
+/** Watermark layout shared by render + clearance audit. */
+export async function buildWatermarkPlan(format, size, captions) {
+  if (captions) {
+    const plan = await resolveWatermarkPlacement(format, captions, size);
+    return {
+      corner: plan.corner,
+      reservePx: plan.reservePx,
+      logoScale: plan.logoScale,
+    };
+  }
+  const logoTargetW = computeLogoTargetWidth(size.width, 1);
+  const logoBuf = await loadLogoBuffer(logoTargetW);
+  const logoMeta = await sharp(logoBuf).metadata();
+  const margin = Math.max(12, Math.round(size.width * 0.02));
+  const corner = format.watermarkCorner || BRAND_WATERMARK_CORNER;
+  const pillPadX = Math.round(logoMeta.width * 0.16);
+  const pillPadY = Math.round(logoMeta.height * 0.32);
+  return {
+    corner,
+    reservePx: computeBrandReservePx(
+      corner,
+      size.width,
+      size.height,
+      logoMeta.width,
+      logoMeta.height,
+      margin,
+      pillPadX,
+      pillPadY
+    ),
+  };
+}
+
+/** Returns zones whose caption ink still overlaps the brand reserve. */
+export async function auditMemeBrandClearance(format, captions) {
+  const size = getRenderSize(format);
+  const plan = await resolveWatermarkPlacement(format, captions, size);
+  const violations = [];
+  for (const zone of format.zones || []) {
+    if (zone.decorative) continue;
+    const text = captions?.[zone.key];
+    if (text == null || !String(text).trim()) continue;
+    const { bbox } = renderZone(zone, text, size.width, size.height, {
+      corner: plan.corner,
+      reservePx: plan.reservePx,
+    });
+    if (captionInkOverlapsBrandReserve(bbox, plan.reservePx)) {
+      violations.push({
+        formatId: format.id,
+        zone: zone.key,
+        text,
+        corner: plan.corner,
+      });
+    }
+  }
+  return violations;
+}
+
+let cachedLogo = null;
+async function loadLogoBuffer(targetWidth) {
+  // We resize on every call so different formats can use different
+  // widths; sharp's resize is fast enough that caching is unnecessary.
+  const logoPath = path.join(
+    process.cwd(),
+    "public",
+    "legends-logo-white.png"
+  );
+  return sharp(logoPath).resize(targetWidth).png().toBuffer();
+}
+
+/**
+ * Render a meme for the given format + filled-in caption map.
+ *
+ * @param {object} format    A meme format from meme-formats.js.
+ * @param {object} captions  Map of zone-key -> string. Missing keys
+ *                           render as empty strings.
+ * @returns {Promise<Buffer>} PNG buffer.
+ */
+export async function renderMeme(format, captions) {
+  // `renderFile` points at a blank imgflip-style template; `file` may
+  // still reference the curated AI gallery PNG used only for thumbnails.
+  const sourcePath = format.renderFile || format.file;
+  const templatePath = path.join(
+    process.cwd(),
+    "public",
+    sourcePath.replace(/^\//, "")
+  );
+
+  // Some "gallery-derived" formats (e.g. waiting-skeleton, doomer)
+  // use the AI-generated gallery PNG as their template — those source
+  // images already carry the Legends of Learning watermark, so the
+  // pipeline must NOT composite a second one on top. The format opts
+  // into this by setting `skipWatermark: true`.
+  const skipWatermark = format.skipWatermark === true;
+
+  // Upscale the source template to at least OUTPUT_MIN_WIDTH so even
+  // small templates (Crying Cat = 300×300, Mocking SpongeBob = 502×353)
+  // get rendered with the same chunky Impact typography weight as the
+  // gallery's high-res references. `kernel: lanczos3` keeps edges
+  // sharp on bitmap upscales.
+  const size = getRenderSize(format);
+  const baseBuf = await sharp(templatePath)
+    .resize(size.width, size.height, { fit: "fill", kernel: "lanczos3" })
+    .toBuffer();
+
+  const placement = skipWatermark
+    ? null
+    : await resolveWatermarkPlacement(format, captions, size);
+
+  const watermark = placement
+    ? { corner: placement.corner, reservePx: placement.reservePx }
+    : null;
+
+  const svg = await buildSvgOverlay(format, captions, watermark, size);
+
+  const composites = [{ input: Buffer.from(svg), top: 0, left: 0 }];
+  if (placement) {
+    const { logoBuf, pillW, pillH, pillLeft, pillTop, logoLeftPx, logoTopPx } =
+      placement;
+    const radius = Math.round(pillH * 0.32);
+    const pillSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${pillW}" height="${pillH}"><rect x="0" y="0" width="${pillW}" height="${pillH}" rx="${radius}" ry="${radius}" fill="black" fill-opacity="0.55"/></svg>`;
+    const pillBuf = Buffer.from(pillSvg);
+    composites.push({
+      input: pillBuf,
+      top: pillTop,
+      left: pillLeft,
+      blend: "over",
+    });
+    composites.push({
+      input: logoBuf,
+      top: logoTopPx,
+      left: logoLeftPx,
+      blend: "over",
+    });
+  }
+
+  const composed = await sharp(baseBuf)
+    .composite(composites)
+    .png({ compressionLevel: 9, quality: 92 })
+    .toBuffer();
+
+  return padPngToSquare(composed);
+}
+
+/** True when planned caption ink overlaps the brand reserve (for tests). */
+export function captionInkOverlapsBrandReserve(bbox, reserve) {
+  return Boolean(bbox && reserve && rectsOverlapPx(bbox, reserve));
+}
