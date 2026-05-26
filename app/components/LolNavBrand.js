@@ -7,10 +7,10 @@ export default function LolNavBrand({ href = "/" }) {
     <>
       <span className="nav-brand-text">{LOL_NAV_LEAD}</span>
       <Image
-        src="/legends-logo-color.png"
+        src="/legends-logo-white.png"
         alt="Legends of Learning"
-        width={163}
-        height={60}
+        width={110}
+        height={40}
         className="nav-brand-logo"
         priority
       />
