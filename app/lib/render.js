@@ -833,7 +833,70 @@ export function getRenderSize(format) {
   };
 }
 
-function renderZone(zone, rawText, imgW, imgH, watermark) {
+function measureZoneFs(zone, rawText, imgW, imgH) {
+  if (rawText == null || String(rawText).trim() === "") return null;
+  const style = resolveZoneStyle(zone);
+  const text = style.transform(String(rawText).trim());
+  const w = zone.w * imgW;
+  const h = zone.h * imgH;
+  const naturalStart = Math.min(h * 0.95, w * 0.42);
+  const zoneMaxFs = zone.maxFontSize ?? Math.floor(h * 0.78);
+  const zoneMinFs =
+    zone.minFontSize ??
+    (zone.style === "doge"
+      ? 44
+      : zone.style === "sign"
+        ? 50
+        : zone.style === "caption"
+          ? 52
+          : 0);
+  const startSize = Math.max(zoneMinFs || 0, Math.min(naturalStart, zoneMaxFs));
+  let { fs } = fitText(
+    text,
+    w,
+    h,
+    zone.maxLines ?? 2,
+    style.family,
+    startSize
+  );
+  if (zoneMinFs > 0 && fs < zoneMinFs) {
+    const retry = fitText(
+      text,
+      w,
+      h,
+      zone.maxLines ?? 2,
+      style.family,
+      Math.max(zoneMinFs, zoneMaxFs, startSize)
+    );
+    fs = retry.fs >= zoneMinFs ? retry.fs : zoneMinFs;
+  }
+  return fs;
+}
+
+function computeSyncSizeCaps(format, captions, imgW, imgH) {
+  const groups = new Map();
+  for (const zone of format.zones) {
+    if (!zone.syncSizeGroup || zone.decorative) continue;
+    const raw = captions?.[zone.key];
+    if (raw == null || !String(raw).trim()) continue;
+    if (!groups.has(zone.syncSizeGroup)) groups.set(zone.syncSizeGroup, []);
+    groups.get(zone.syncSizeGroup).push(zone);
+  }
+  const caps = new Map();
+  for (const [, zones] of groups) {
+    if (zones.length < 2) continue;
+    let minFs = Infinity;
+    for (const zone of zones) {
+      const fs = measureZoneFs(zone, captions[zone.key], imgW, imgH);
+      if (fs != null) minFs = Math.min(minFs, fs);
+    }
+    if (!Number.isFinite(minFs)) continue;
+    for (const zone of zones) caps.set(zone.key, minFs);
+  }
+  return caps;
+}
+
+function renderZone(zone, rawText, imgW, imgH, watermark, syncCapFs) {
   if (rawText == null || String(rawText).trim() === "") {
     return { fragment: "", bbox: null };
   }
@@ -866,6 +929,9 @@ function renderZone(zone, rawText, imgW, imgH, watermark) {
           ? 52
           : 0);
   let startSize = Math.max(zoneMinFs || 0, Math.min(naturalStart, zoneMaxFs));
+  if (syncCapFs != null) {
+    startSize = Math.min(startSize, syncCapFs);
+  }
 
   let { fs, lines, lineHeight } = fitText(
     text,
@@ -895,6 +961,20 @@ function renderZone(zone, rawText, imgW, imgH, watermark) {
       );
       lineHeight = zoneMinFs;
     }
+  }
+
+  if (syncCapFs != null && fs > syncCapFs) {
+    const capped = fitText(
+      text,
+      w,
+      h,
+      zone.maxLines ?? 2,
+      style.family,
+      syncCapFs
+    );
+    fs = Math.min(capped.fs, syncCapFs);
+    lines = capped.lines;
+    lineHeight = capped.fs;
   }
 
   const align = zone.align || "center";
@@ -1018,6 +1098,7 @@ async function buildSvgOverlay(format, captions, watermark, size) {
   const H = size.height;
   const fontStyle = await getFontStyle();
   const parts = [];
+  const syncCaps = computeSyncSizeCaps(format, captions, W, H);
   // First pass: any per-zone background mask. Used by gallery-derived
   // templates whose source pixels already carry an AI-baked caption
   // (and watermark). The mask is opaque and covers the FULL zone —
@@ -1051,7 +1132,14 @@ async function buildSvgOverlay(format, captions, watermark, size) {
   }
   for (const zone of format.zones) {
     if (zone.decorative) continue;
-    const rendered = renderZone(zone, captions?.[zone.key], W, H, watermark);
+    const rendered = renderZone(
+      zone,
+      captions?.[zone.key],
+      W,
+      H,
+      watermark,
+      syncCaps.get(zone.key)
+    );
     if (rendered?.fragment) parts.push(rendered.fragment);
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">

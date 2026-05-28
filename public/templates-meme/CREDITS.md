@@ -43,3 +43,4 @@ For a production deployment of this app you should:
 | `spider-pointing.jpg` | Spider-Man Pointing (3-Spideys variant) |
 | `sad-pablo.jpg` | Sad Pablo Escobar (waiting) |
 | `pam-same-picture.jpg` | They're the Same Picture (Pam, The Office) |
+| `pam-same-picture-gallery.png` | Blank gallery-layout Pam template (text erased for customize) |

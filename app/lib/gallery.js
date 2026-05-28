@@ -604,6 +604,7 @@ export const galleryItems = [
     captions: {
       left: "Group work",
       right: "One kid doing everything",
+      bottom: "They're the same picture",
     },
     situations: ["group-work"],
   },
@@ -875,6 +876,7 @@ export const galleryItems = [
     captions: {
       left: "Lesson plan",
       right: "After the bell rings",
+      bottom: "They're the same picture",
     },
     situations: ["lesson-planning", "classroom-management"],
   },

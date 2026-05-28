@@ -916,47 +916,75 @@ export const memeFormats = [
   },
 
   // ── 25. They're the Same Picture (Pam) ─────────────────────────────
-  // Pam from The Office holding two near-identical papers. The
-  // canvas already has the canonical "They're the same picture"
-  // subtitle baked in; we fill in the two papers with the things
-  // being compared. "Sign" style = dark Impact ALL CAPS on the
-  // white paper.
+  // Gallery AI art is the render source (single Pam frame + papers +
+  // bottom punchline). Customize masks baked text and re-renders all
+  // three zones in classic Impact caption style — NOT the two-panel TV
+  // meme template with yellow subtitles.
   {
     id: "same-picture",
     name: "They're the Same Picture",
-    file: `${FILE_BASE}/pam-same-picture.jpg`,
-    width: 875,
-    height: 980,
-    // Canonical bottom line is baked into the template / gallery art.
-    bakedObstacles: [
-      { x: 0, y: 0.6, w: 1, h: 0.4 },
-      { x: 0, y: 0, w: 1, h: 0.22 },
-    ],
+    file: "/gallery/same-picture-group-work.png",
+    renderFile: "/templates-meme/pam-same-picture-gallery.png",
+    width: 1536,
+    height: 1536,
+    skipWatermark: true,
     description:
       "Pam from The Office holding up two pieces of paper that are 'definitely different' but obviously identical. Use it for two classroom things that pretend to be different but absolutely are not.",
     jokeStructure:
-      "LEFT = thing A. RIGHT = thing B that's officially different but is functionally identical. Both 1-5 words. The school world is full of these — the canonical caption ('They're the same picture') is already on the image. E.g. LEFT='Group work' / RIGHT='One kid doing all the work'.",
+      "LEFT = thing A. RIGHT = thing B that's officially different but is functionally identical. BOTTOM = the punchline ('They're the same picture'). Each paper line 1-5 words.",
     zones: [
       {
         key: "left",
         label: "Left paper (thing A)",
-        x: 0.05, y: 0.09, w: 0.34, h: 0.25,
-        align: "center", style: "sign", maxLines: 2, minFontSize: 48,
+        x: 0.15, y: 0.18, w: 0.30, h: 0.28,
+        align: "center", style: "caption", maxLines: 3,
+        syncSizeGroup: "papers",
       },
       {
         key: "right",
         label: "Right paper (thing B that's somehow the same)",
-        x: 0.50, y: 0.10, w: 0.34, h: 0.25,
-        align: "center", style: "sign", maxLines: 2, minFontSize: 48,
+        x: 0.56, y: 0.18, w: 0.30, h: 0.32,
+        align: "center", style: "caption", maxLines: 3,
+        syncSizeGroup: "papers",
+      },
+      {
+        key: "bottom",
+        label: "Bottom line (the punchline)",
+        x: 0, y: 0.78, w: 1, h: 0.18,
+        align: "center", style: "caption", maxLines: 2,
       },
     ],
     exampleCaptions: [
-      { left: "Group work", right: "One kid doing all the work" },
-      { left: "Lesson plan", right: "Whatever happens after the bell rings" },
-      { left: "Fire drill", right: "Indoor recess" },
-      { left: "Differentiation", right: "Twelve different lesson plans" },
-      { left: "Hall pass", right: "Field trip" },
-      { left: "Parent-teacher conference", right: "Group therapy" },
+      {
+        left: "Group work",
+        right: "One kid doing all the work",
+        bottom: "They're the same picture",
+      },
+      {
+        left: "Lesson plan",
+        right: "Whatever happens after the bell rings",
+        bottom: "They're the same picture",
+      },
+      {
+        left: "Fire drill",
+        right: "Indoor recess",
+        bottom: "They're the same picture",
+      },
+      {
+        left: "Differentiation",
+        right: "Twelve different lesson plans",
+        bottom: "They're the same picture",
+      },
+      {
+        left: "Hall pass",
+        right: "Field trip",
+        bottom: "They're the same picture",
+      },
+      {
+        left: "Parent-teacher conference",
+        right: "Group therapy",
+        bottom: "They're the same picture",
+      },
     ],
   },
 
