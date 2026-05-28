@@ -1,6 +1,12 @@
+/** Strip whitespace and accidental quotes from Vercel env values. */
+export function normalizeOpenAIKey(raw = process.env.OPENAI_API_KEY) {
+  if (!raw || typeof raw !== "string") return "";
+  return raw.trim().replace(/^["']|["']$/g, "");
+}
+
 /** OpenAI key present — required for full safety review on save. */
 export function hasOpenAIKey() {
-  return Boolean(process.env.OPENAI_API_KEY?.trim());
+  return Boolean(normalizeOpenAIKey());
 }
 
 /**

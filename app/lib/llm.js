@@ -10,15 +10,17 @@
 // short caption / scoring calls, and the humor quality bump is the
 // single biggest lever for "actually-funny" output. Override with
 // OPENAI_MODEL if you want to A/B a different model.
+import { normalizeOpenAIKey } from "./moderation-policy.js";
+
 const DEFAULT_MODEL = "gpt-4.1";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
 export function llmConfigured() {
-  return Boolean(process.env.OPENAI_API_KEY);
+  return Boolean(normalizeOpenAIKey());
 }
 
 async function callOpenAI({ system, user, jsonMode, temperature, maxTokens }) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = normalizeOpenAIKey();
   if (!apiKey) {
     const err = new Error("LLM is not configured (no API key).");
     err.code = "LLM_NOT_CONFIGURED";

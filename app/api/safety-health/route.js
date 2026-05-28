@@ -42,7 +42,7 @@ export async function GET() {
       openaiKeyConfigured: hasOpenAIKey(),
       status: mod.category || "error",
       reason: mod.reason,
-      detail: mod.error ? String(mod.error).slice(0, 200) : undefined,
+      detail: mod.error ? String(mod.error).slice(0, 400) : undefined,
       hint: hintForModerationFailure(mod),
     });
   } catch (err) {

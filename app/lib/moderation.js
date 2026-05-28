@@ -5,6 +5,7 @@
 import {
   failClosedOnModerationSkip,
   MODERATION_UNAVAILABLE_MESSAGE,
+  normalizeOpenAIKey,
 } from "./moderation-policy.js";
 
 const MODERATION_URL = "https://api.openai.com/v1/moderations";
@@ -125,7 +126,7 @@ async function callModerationOnce(input, apiKey) {
 }
 
 async function callModeration(input) {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  const apiKey = normalizeOpenAIKey();
   if (!apiKey) {
     return unavailableResult("no_api_key");
   }
