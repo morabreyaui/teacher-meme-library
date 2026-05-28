@@ -6,44 +6,55 @@ import {
 
 /** GET — diagnose OpenAI moderation setup (no secrets returned). */
 export async function GET() {
-  if (saveBlockedWithoutApi()) {
-    return NextResponse.json({
-      ok: false,
-      openaiKeyConfigured: false,
-      status: "not_configured",
-      hint: "Add OPENAI_API_KEY in Vercel → Settings → Environment Variables → Production, then Redeploy.",
-    });
-  }
+  try {
+    if (saveBlockedWithoutApi()) {
+      return NextResponse.json({
+        ok: false,
+        openaiKeyConfigured: false,
+        status: "not_configured",
+        hint: "Add OPENAI_API_KEY in Vercel → Settings → Environment Variables → Production, then Redeploy.",
+      });
+    }
 
-  const mod = await moderateText("Safe teacher classroom meme test.");
+    const mod = await moderateText("Safe teacher classroom meme test.");
 
-  if (mod.ok && !mod.skipped) {
-    return NextResponse.json({
-      ok: true,
-      openaiKeyConfigured: true,
-      status: "ok",
-      hint: "Moderation API is working. Customize save should work.",
-    });
-  }
+    if (mod.ok && !mod.skipped) {
+      return NextResponse.json({
+        ok: true,
+        openaiKeyConfigured: true,
+        status: "ok",
+        hint: "Moderation API is working. Customize save should work.",
+      });
+    }
 
-  if (mod.ok && mod.skipped) {
+    if (mod.ok && mod.skipped) {
+      return NextResponse.json({
+        ok: false,
+        openaiKeyConfigured: hasOpenAIKey(),
+        status: "skipped",
+        reason: mod.reason,
+        hint: "Key is set but moderation was skipped. Check OPENAI_API_KEY value and redeploy.",
+      });
+    }
+
     return NextResponse.json({
       ok: false,
       openaiKeyConfigured: hasOpenAIKey(),
-      status: "skipped",
+      status: mod.category || "error",
       reason: mod.reason,
-      hint: "Key is set but moderation was skipped. Check OPENAI_API_KEY value and redeploy.",
+      detail: mod.error ? String(mod.error).slice(0, 200) : undefined,
+      hint: hintForModerationFailure(mod),
     });
+  } catch (err) {
+    return NextResponse.json(
+      {
+        ok: false,
+        status: "handler_error",
+        detail: err?.message ? String(err.message).slice(0, 200) : "Unknown error",
+      },
+      { status: 500 }
+    );
   }
-
-  return NextResponse.json({
-    ok: false,
-    openaiKeyConfigured: hasOpenAIKey(),
-    status: mod.category || "error",
-    reason: mod.reason,
-    detail: mod.error ? String(mod.error).slice(0, 200) : undefined,
-    hint: hintForModerationFailure(mod),
-  });
 }
 
 function hintForModerationFailure(mod) {
