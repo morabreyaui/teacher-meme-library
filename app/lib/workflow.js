@@ -36,6 +36,12 @@ import {
 import { callJSON, llmConfigured } from "./llm";
 import { findBlockedTerm, BLOCKLIST_USER_MESSAGE } from "./blocklist";
 import { describeBlock, moderateText } from "./moderation";
+import {
+  failClosedOnModerationSkip,
+  saveBlockedWithoutApi,
+  MODERATION_NOT_CONFIGURED_MESSAGE,
+  MODERATION_UNAVAILABLE_MESSAGE,
+} from "./moderation-policy";
 import { renderMeme } from "./render";
 import { newMemeId, saveMeme } from "./storage";
 
@@ -413,26 +419,18 @@ async function step8_adversarialReview({ candidates, idx }) {
       event: { ...event, ok: false, category: mod.category },
     };
   }
-  if (mod.skipped) {
-    const { moderationRequired, MODERATION_UNAVAILABLE_MESSAGE } = await import(
-      "./moderation-policy.js"
-    );
-    if (moderationRequired()) {
-      return {
-        ok: false,
-        reason: "moderation_unavailable",
-        message: MODERATION_UNAVAILABLE_MESSAGE,
-        event: { ...event, ok: false, skipped: mod.reason },
-      };
-    }
+  if (mod.skipped && failClosedOnModerationSkip()) {
+    return {
+      ok: false,
+      reason: "moderation_unavailable",
+      message: mod.message || MODERATION_UNAVAILABLE_MESSAGE,
+      event: { ...event, ok: false, skipped: mod.reason },
+    };
   }
 
   // Layer C: stricter LLM-based brand review (skipped if no API key).
   if (!llmConfigured()) {
-    const { moderationRequired, MODERATION_UNAVAILABLE_MESSAGE } = await import(
-      "./moderation-policy.js"
-    );
-    if (moderationRequired()) {
+    if (failClosedOnModerationSkip()) {
       return {
         ok: false,
         reason: "moderation_unavailable",
@@ -468,10 +466,7 @@ Output STRICT JSON: { "ok": true } if the caption is safe to ship. { "ok": false
       maxTokens: 80,
     });
   } catch (e) {
-    const { moderationRequired, MODERATION_UNAVAILABLE_MESSAGE } = await import(
-      "./moderation-policy.js"
-    );
-    if (moderationRequired()) {
+    if (failClosedOnModerationSkip()) {
       return {
         ok: false,
         reason: "moderation_unavailable",
@@ -495,6 +490,14 @@ Output STRICT JSON: { "ok": true } if the caption is safe to ship. { "ok": false
 
 // ─── Validate user-supplied caption (Edit / manual mode) ─────────────────
 export async function validateUserCaptions(format, captions) {
+  if (saveBlockedWithoutApi()) {
+    return {
+      ok: false,
+      reason: "not_configured",
+      message: MODERATION_NOT_CONFIGURED_MESSAGE,
+    };
+  }
+
   const flat = Object.values(captions || {})
     .filter(Boolean)
     .join("\n");
@@ -526,23 +529,19 @@ export async function validateUserCaptions(format, captions) {
   if (!mod.ok) {
     return {
       ok: false,
-      reason: "moderation",
+      reason: mod.category === "moderation_unavailable" ? "moderation_unavailable" : "moderation",
       message:
+        mod.message ||
         describeBlock(mod) ||
         "This caption doesn't meet our community guidelines.",
     };
   }
-  if (mod.skipped) {
-    const { moderationRequired, MODERATION_UNAVAILABLE_MESSAGE } = await import(
-      "./moderation-policy.js"
-    );
-    if (moderationRequired()) {
-      return {
-        ok: false,
-        reason: "moderation_unavailable",
-        message: MODERATION_UNAVAILABLE_MESSAGE,
-      };
-    }
+  if (mod.skipped && failClosedOnModerationSkip()) {
+    return {
+      ok: false,
+      reason: "moderation_unavailable",
+      message: mod.message || MODERATION_UNAVAILABLE_MESSAGE,
+    };
   }
   return { ok: true };
 }

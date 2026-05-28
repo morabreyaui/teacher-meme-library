@@ -3,7 +3,7 @@
 // Educational context => stricter thresholds than OpenAI's defaults.
 
 import {
-  moderationRequired,
+  failClosedOnModerationSkip,
   MODERATION_UNAVAILABLE_MESSAGE,
 } from "./moderation-policy.js";
 
@@ -82,7 +82,7 @@ function evaluateResult(result) {
 }
 
 function unavailableResult(reason, extra = {}) {
-  if (moderationRequired()) {
+  if (failClosedOnModerationSkip()) {
     return {
       ok: false,
       skipped: true,
@@ -103,36 +103,50 @@ function unavailableResult(reason, extra = {}) {
   };
 }
 
+async function callModerationOnce(input, apiKey) {
+  const response = await fetch(MODERATION_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model: MODERATION_MODEL, input }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    const err = new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  const data = await response.json();
+  return evaluateResult(data?.results?.[0]);
+}
+
 async function callModeration(input) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
   if (!apiKey) {
     return unavailableResult("no_api_key");
   }
 
-  let response;
   try {
-    response = await fetch(MODERATION_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ model: MODERATION_MODEL, input }),
-    });
+    return await callModerationOnce(input, apiKey);
   } catch (err) {
-    return unavailableResult("network_error", { error: err?.message });
+    const retryable =
+      !err.status || err.status >= 500 || err.status === 429;
+    if (retryable) {
+      await new Promise((r) => setTimeout(r, 400));
+      try {
+        return await callModerationOnce(input, apiKey);
+      } catch (retryErr) {
+        return unavailableResult("network_error", {
+          error: retryErr?.message || err?.message,
+        });
+      }
+    }
+    return unavailableResult("api_error", { error: err?.message });
   }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    return unavailableResult("api_error", {
-      error: `HTTP ${response.status}: ${text.slice(0, 200)}`,
-    });
-  }
-
-  const data = await response.json();
-  const result = data?.results?.[0];
-  return evaluateResult(result);
 }
 
 export async function moderateText(text) {

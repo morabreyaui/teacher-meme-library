@@ -1,10 +1,7 @@
 import { NextResponse } from "next/server";
 import { findBlockedTerm, BLOCKLIST_USER_MESSAGE } from "../../lib/blocklist";
 import { describeBlock, moderateText } from "../../lib/moderation";
-import {
-  moderationRequired,
-  MODERATION_UNAVAILABLE_MESSAGE,
-} from "../../lib/moderation-policy";
+import { saveBlockedWithoutApi, MODERATION_NOT_CONFIGURED_MESSAGE } from "../../lib/moderation-policy";
 
 export async function POST(request) {
   try {
@@ -15,6 +12,18 @@ export async function POST(request) {
 
     if (!value.trim()) {
       return NextResponse.json({ ok: true, blocked: false });
+    }
+
+    if (saveBlockedWithoutApi()) {
+      return NextResponse.json(
+        {
+          ok: false,
+          blocked: true,
+          category: "not_configured",
+          message: MODERATION_NOT_CONFIGURED_MESSAGE,
+        },
+        { status: 503 }
+      );
     }
 
     const blocked = findBlockedTerm(value);
@@ -45,19 +54,13 @@ export async function POST(request) {
         { status: 400 }
       );
     }
-    if (moderation.skipped && moderationRequired()) {
-      return NextResponse.json(
-        {
-          ok: false,
-          blocked: true,
-          category: "moderation_unavailable",
-          message: MODERATION_UNAVAILABLE_MESSAGE,
-        },
-        { status: 503 }
-      );
-    }
-
-    return NextResponse.json({ ok: true, blocked: false });
+    // Live preview: blocklist + OpenAI when available. If API is down, allow
+    // editing; save still runs the full review stack.
+    return NextResponse.json({
+      ok: true,
+      blocked: false,
+      reviewLevel: moderation.skipped ? "blocklist_only" : "full",
+    });
   } catch (error) {
     console.error("Moderate-text error:", error);
     return NextResponse.json(
