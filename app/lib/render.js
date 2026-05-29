@@ -17,6 +17,7 @@
 import "./font-setup.js";
 import sharp from "sharp";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { ensureFontsInstalled } from "./font-setup.js";
 
@@ -912,7 +913,7 @@ function renderZone(zone, rawText, imgW, imgH, watermark, syncCapFs, coverBaked)
   if (coverBaked && style.strokeRatio > 0) {
     style = {
       ...style,
-      strokeRatio: Math.min(0.42, style.strokeRatio * 1.55),
+      strokeRatio: Math.min(0.48, style.strokeRatio * 1.85),
     };
   }
   const text = style.transform(normalizeCaptionText(String(rawText).trim()));
@@ -1062,7 +1063,7 @@ function renderZone(zone, rawText, imgW, imgH, watermark, syncCapFs, coverBaked)
     const knockout = lines
       .map((line, i) => {
         const ly = firstBaseline + i * lineHeight;
-        const kStroke = Math.min(48, strokeWidthFinal * 2.4);
+        const kStroke = Math.min(56, strokeWidthFinal * 3.2);
         return `<text x="${tx.toFixed(2)}" y="${ly.toFixed(
           2
         )}" font-family="${style.family}" font-size="${fs.toFixed(
@@ -1407,12 +1408,9 @@ async function loadLogoBuffer(targetWidth) {
  * @returns {Promise<Buffer>} PNG buffer.
  */
 // Gallery thumbnail → blank customize template. Keeps the curated
-// gallery cat/art instead of swapping in a different imgflip JPEG.
-export const GALLERY_RENDER_SOURCES = {
-  "/gallery/disaster-girl-admin.png":
-    "/templates-meme/disaster-girl-gallery-blank.png",
-  "/gallery/grumpy-cat-plans.png":
-    "/templates-meme/grumpy-cat-plans-blank.png",
+// gallery art instead of swapping in a different imgflip JPEG.
+// Most blanks live under templates-meme/gallery-blanks/ (auto-resolved).
+export const GALLERY_BLANK_OVERRIDES = {
   "/gallery/crying-cat-papers.png":
     "/templates-meme/crying-cat-gallery-papers.png",
   "/gallery/crying-cat-copier.png":
@@ -1422,6 +1420,26 @@ export const GALLERY_RENDER_SOURCES = {
   "/gallery/same-picture-bell.png":
     "/templates-meme/pam-same-picture-gallery.png",
 };
+
+/** @deprecated use resolveGalleryBlankPath */
+export const GALLERY_RENDER_SOURCES = GALLERY_BLANK_OVERRIDES;
+
+export function galleryBlankRelPath(sourceFile) {
+  if (!sourceFile?.startsWith("/gallery/")) return null;
+  const base = path.basename(sourceFile, ".png");
+  return `/templates-meme/gallery-blanks/${base}-blank.png`;
+}
+
+export function resolveGalleryBlankPath(sourceFile) {
+  if (!sourceFile) return null;
+  if (GALLERY_BLANK_OVERRIDES[sourceFile]) {
+    return GALLERY_BLANK_OVERRIDES[sourceFile];
+  }
+  const rel = galleryBlankRelPath(sourceFile);
+  if (!rel) return null;
+  const full = path.join(process.cwd(), "public", rel.replace(/^\//, ""));
+  return existsSync(full) ? rel : null;
+}
 
 function isGalleryPath(filePath) {
   return typeof filePath === "string" && filePath.includes("/gallery/");
@@ -1433,6 +1451,81 @@ function defaultZoneMaskFill(zone) {
     return "#ffffff";
   }
   return "#000000";
+}
+
+/** Zone-only erase — never crops the photo into a letterbox strip. */
+function zoneEraseRectForBlank(zone, W, H, format, { imageHasLetterbox = false } = {}) {
+  const zones = (format?.zones || []).filter((z) => !z.decorative);
+  const twoPanel =
+    zones.length <= 2 && (zone.y + zone.h <= 0.3 || zone.y >= 0.68);
+  const letterboxStyle = imageHasLetterbox && twoPanel;
+  const captionBand = zone.y + zone.h <= 0.3 || zone.y >= 0.68;
+  const bleedY = letterboxStyle || captionBand ? 0.05 : Math.max(0.032, zone.h * 0.42);
+  const bleedX = letterboxStyle || captionBand
+    ? 0.025
+    : Math.max(0.028, zone.w * 0.14);
+  if (zone.style === "sign" || zone.style === "dark-on-light") {
+    const padX = zone.w * 0.04;
+    const padY = zone.h * 0.1;
+    return {
+      x: Math.max(0, (zone.x - padX) * W),
+      y: Math.max(0, (zone.y - padY) * H),
+      w: Math.min(W, (zone.w + padX * 2) * W),
+      h: Math.min(H, (zone.h + padY * 2) * H),
+    };
+  }
+  const x = Math.max(0, (zone.x - bleedX) * W);
+  const y = Math.max(0, (zone.y - bleedY) * H);
+  const w = Math.min(W - x, (zone.w + bleedX * 2) * W);
+  const h = Math.min(H - y, (zone.h + bleedY * 2) * H);
+  return { x, y, w, h };
+}
+
+/** Build a blank gallery template — clear caption areas without cropping the photo. */
+export async function buildGalleryBlankTemplate(imageBuf, format) {
+  const meta = await sharp(imageBuf).metadata();
+  const W = meta.width;
+  const H = meta.height;
+  const captionZones = (format?.zones || []).filter((z) => !z.decorative);
+  const letterbox = await galleryUsesLetterboxBands(imageBuf);
+  const parts = [];
+
+  if (letterbox) {
+    const bounds = await detectLetterboxBandBounds(imageBuf);
+    const topH = Math.round(H * bounds.topEndFrac);
+    const bottomY = Math.round(H * bounds.bottomStartFrac);
+    parts.push(
+      `<rect x="0" y="0" width="${W}" height="${topH}" fill="#000000"/>`,
+      `<rect x="0" y="${bottomY}" width="${W}" height="${H - bottomY}" fill="#000000"/>`
+    );
+    if (captionZones.length > 2) {
+      for (const zone of captionZones) {
+        const rect = zoneEraseRectForBlank(zone, W, H, format, {
+          imageHasLetterbox: true,
+        });
+        const fill = defaultZoneMaskFill(zone);
+        parts.push(
+          `<rect x="${rect.x.toFixed(2)}" y="${rect.y.toFixed(2)}" width="${rect.w.toFixed(2)}" height="${rect.h.toFixed(2)}" fill="${fill}"/>`
+        );
+      }
+    }
+  } else {
+    for (const zone of captionZones) {
+      const rect = zoneEraseRectForBlank(zone, W, H, format, {
+        imageHasLetterbox: false,
+      });
+      const fill = defaultZoneMaskFill(zone);
+      parts.push(
+        `<rect x="${rect.x.toFixed(2)}" y="${rect.y.toFixed(2)}" width="${rect.w.toFixed(2)}" height="${rect.h.toFixed(2)}" fill="${fill}"/>`
+      );
+    }
+  }
+
+  if (!parts.length) return imageBuf;
+  const svg = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${parts.join("")}</svg>`
+  );
+  return sharp(imageBuf).composite([{ input: svg, top: 0, left: 0 }]).toBuffer();
 }
 
 /** Erase rect for baked gallery captions (letterbox bars vs on-photo zones). */
@@ -1558,6 +1651,28 @@ async function detectLetterboxBandBounds(imageBuf) {
   };
 }
 
+async function eraseGalleryCaptionsZoneOnly(baseBuf, format, size) {
+  const W = size.width;
+  const H = size.height;
+  const letterbox = await galleryUsesLetterboxBands(baseBuf);
+  const parts = [];
+  for (const zone of format.zones) {
+    if (zone.decorative) continue;
+    const rect = zoneEraseRectForBlank(zone, W, H, format, {
+      imageHasLetterbox: letterbox,
+    });
+    const fill = defaultZoneMaskFill(zone);
+    parts.push(
+      `<rect x="${rect.x.toFixed(2)}" y="${rect.y.toFixed(2)}" width="${rect.w.toFixed(2)}" height="${rect.h.toFixed(2)}" fill="${fill}"/>`
+    );
+  }
+  if (!parts.length) return baseBuf;
+  const svg = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">${parts.join("")}</svg>`
+  );
+  return sharp(baseBuf).composite([{ input: svg, top: 0, left: 0 }]).toBuffer();
+}
+
 async function eraseBakedCaptionsFromBase(baseBuf, format, size, opts = {}) {
   const W = size.width;
   const H = size.height;
@@ -1578,15 +1693,14 @@ async function eraseBakedCaptionsFromBase(baseBuf, format, size, opts = {}) {
 }
 
 function resolveRenderSource(format, sourceFile) {
-  if (sourceFile && GALLERY_RENDER_SOURCES[sourceFile]) {
-    return GALLERY_RENDER_SOURCES[sourceFile];
-  }
+  const blank = resolveGalleryBlankPath(sourceFile);
+  if (blank) return blank;
   if (sourceFile) return sourceFile;
   return format.renderFile || format.file;
 }
 
 function usesBlankGalleryTemplate(sourceFile) {
-  return Boolean(sourceFile && GALLERY_RENDER_SOURCES[sourceFile]);
+  return Boolean(resolveGalleryBlankPath(sourceFile));
 }
 
 export async function renderMeme(format, captions, options = {}) {
@@ -1608,30 +1722,24 @@ export async function renderMeme(format, captions, options = {}) {
       ? { width: meta.width, height: meta.height }
       : getRenderSize(format);
 
+  const blankTemplate = resolveGalleryBlankPath(options.sourceFile);
   const eraseBakedCaptions =
-    isGalleryPath(options.sourceFile) &&
-    !usesBlankGalleryTemplate(options.sourceFile);
+    isGalleryPath(options.sourceFile) && !blankTemplate;
 
   const skipWatermark =
-    format.skipWatermark === true || isGalleryPath(options.sourceFile);
+    format.skipWatermark === true ||
+    (isGalleryPath(options.sourceFile) && !options.galleryCard);
 
   let baseBuf = await sharp(templatePath)
     .resize(size.width, size.height, { fit: "fill", kernel: "lanczos3" })
     .toBuffer();
 
   let coverBakedCaptions = false;
-  if (eraseBakedCaptions) {
-    const letterbox = await galleryUsesLetterboxBands(baseBuf);
-    const bandBounds = letterbox
-      ? await detectLetterboxBandBounds(baseBuf)
-      : null;
-    baseBuf = await eraseBakedCaptionsFromBase(baseBuf, format, size, {
-      letterbox,
-      bandBounds,
-    });
-    // Knockout stroke paints over any baked caption pixels that survive
-    // the band erase (common when Impact strokes bleed into the photo).
+  if (isGalleryPath(options.sourceFile) && !blankTemplate) {
     coverBakedCaptions = true;
+    if (eraseBakedCaptions) {
+      baseBuf = await eraseGalleryCaptionsZoneOnly(baseBuf, format, size);
+    }
   }
 
   const placement = skipWatermark
